@@ -46,7 +46,7 @@ use {
     futures::{StreamExt, channel::mpsc},
     model::order::OrderKind,
     number::conversions::u256_to_big_decimal,
-    std::{sync::Arc, time::Instant},
+    std::{collections::BTreeMap, sync::Arc, time::Instant},
     tracing::{Instrument, instrument},
     winner_selection as winsel,
 };
@@ -69,6 +69,9 @@ pub struct FastPathHandler {
     /// `/settle` call entirely and just writes `valid_from = now()` so
     /// the order flows into the next regular auction.
     fast_path_enabled: bool,
+    /// Shared with the regular auction loop so fast-path orders get the same
+    /// CIP-87 penalty cap.
+    penalty_cap_calculator: Option<Arc<domain::penalty_cap::PenaltyCapCalculator>>,
 }
 
 impl FastPathHandler {
@@ -82,6 +85,7 @@ impl FastPathHandler {
         settle_coordinator: Arc<SettleCall>,
         submission_deadline: u64,
         fast_path_enabled: bool,
+        penalty_cap_calculator: Option<Arc<domain::penalty_cap::PenaltyCapCalculator>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             eth,
@@ -92,6 +96,7 @@ impl FastPathHandler {
             settle_coordinator,
             submission_deadline,
             fast_path_enabled,
+            penalty_cap_calculator,
         })
     }
 
@@ -435,6 +440,22 @@ impl FastPathHandler {
 
         let reference_score = compute_reference_score(staged.data.auction_id, &solution_rows)?;
 
+        // Same CIP-87 penalty cap as a regular auction; 0 when penalties are
+        // disabled in the config.
+        let penalty_cap_native = self
+            .penalty_cap_calculator
+            .as_ref()
+            .map(|calculator| {
+                let prices: BTreeMap<Address, U256> = staged
+                    .data
+                    .native_prices
+                    .iter()
+                    .map(|(token, price)| (*token, *price))
+                    .collect();
+                u256_to_big_decimal(&calculator.calculate(&order, &prices).0)
+            })
+            .unwrap_or_else(|| 0.into());
+
         self.persistence
             .finalize_fast_path(FastPathPromotion {
                 quote_id: staged.quote_id,
@@ -447,10 +468,7 @@ impl FastPathHandler {
                 solutions: solution_rows,
                 fee_policies: volume_fee_policies.clone(),
                 reference_score,
-                // TODO: populate penalty caps correctly. For a brief period after the
-                // launch there will be no penalties but we already need to store a
-                // 0 value for the accounting pipeline to work.
-                penalty_cap_native: 0.into(),
+                penalty_cap_native,
             })
             .await
             .map_err(PreflightError::PersistFailed)?;
