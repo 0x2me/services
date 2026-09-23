@@ -46,6 +46,7 @@ use {
     futures::{StreamExt, channel::mpsc},
     model::order::OrderKind,
     number::conversions::u256_to_big_decimal,
+    price_estimation::native::to_normalized_price,
     std::{collections::BTreeMap, sync::Arc, time::Instant},
     tracing::{Instrument, instrument},
     winner_selection as winsel,
@@ -429,7 +430,7 @@ impl FastPathHandler {
                         side,
                     }],
                     // Natural single-trade UCP encoding: sell/buy prices are
-                    // just the quoted amounts of the other side.
+                    // just the quoted amounts of the other side.0
                     price_tokens: vec![sell_token, buy_token],
                     price_values: vec![limit_buy, limit_sell],
                 })
@@ -446,12 +447,20 @@ impl FastPathHandler {
             .penalty_cap_calculator
             .as_ref()
             .map(|calculator| {
-                let prices: BTreeMap<Address, U256> = staged
+                let mut prices: BTreeMap<Address, U256> = staged
                     .data
                     .native_prices
                     .iter()
                     .map(|(token, price)| (*token, *price))
                     .collect();
+                // Buy-ETH orders key the native price under the ETH marker, but
+                // the calculator looks it up under WETH. Insert WETH at 1 so
+                // the lookup hits.
+                prices
+                    .entry(*self.eth.contracts().weth().address())
+                    .or_insert_with(|| {
+                        to_normalized_price(1.0).expect("1.0 is a valid native price")
+                    });
                 u256_to_big_decimal(&calculator.calculate(&order, &prices).0)
             })
             .unwrap_or_else(|| 0.into());
